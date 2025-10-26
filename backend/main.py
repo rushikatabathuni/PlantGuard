@@ -1,6 +1,6 @@
-from fastapi import FastAPI, File, UploadFile, Depends, HTTPException
+from fastapi import FastAPI, File, UploadFile, Depends, HTTPException, status, Header
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime
@@ -8,7 +8,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import os
 import shutil
-from typing import Optional
+from typing import Optional, List
 from datetime import timedelta
 
 
@@ -24,7 +24,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "https://*.vercel.app",
-        "https://plant-guard-two.vercel.app/"  # Update after Vercel deployment
+        "https://plant-guard-two.vercel.app" # Your specific Vercel URL
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -48,7 +48,7 @@ class User(Base):
 class Detection(Base):
     __tablename__ = "detections"
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String)
+    username = Column(String) # Links to User.username
     disease_class = Column(String)
     confidence = Column(Float)
     advisory = Column(String)
@@ -60,6 +60,7 @@ Base.metadata.create_all(bind=engine)
 # Authentication
 pwd_context = CryptContext(schemes=["bcrypt"])
 SECRET_KEY = "your-secret-key-for-jwt"  # Change this in production
+ADMIN_EMAIL = "admin@plantguard.com" # Admin user identifier
 
 def get_password_hash(password):
     from passlib.context import CryptContext
@@ -76,7 +77,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     if expires_delta:
         expire = datetime.utcnow() + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        # Increased token expiry time
+        expire = datetime.utcnow() + timedelta(days=1)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
     return encoded_jwt
@@ -88,13 +90,65 @@ def get_db():
     finally:
         db.close()
 
-def get_current_user(authorization: str = Depends(lambda: None)):
-    # Simplified authentication for demo
-    # In production, implement full JWT validation
-    return "demo-user"
+# === NEW AUTH DEPENDENCIES ===
+
+async def get_current_user(
+    authorization: Optional[str] = Header(None), 
+    db: Session = Depends(get_db)
+) -> User:
+    """
+    Decodes the JWT token from the Authorization header and returns the User object.
+    """
+    if authorization is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header missing",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer":
+            raise ValueError("Invalid auth scheme")
+    except ValueError:
+            raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+async def get_current_username(user: User = Depends(get_current_user)) -> str:
+    """Returns the username string of the current user."""
+    return user.username
+
+def get_admin_user(current_user: User = Depends(get_current_user)) -> User:
+    """
+    Checks if the current user is an admin.
+    Raises 403 Forbidden if not.
+    """
+    if current_user.email != ADMIN_EMAIL:
+         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return current_user
 
 # Initialize detector
-from disease_detector import DiseaseDetector
 detector = DiseaseDetector(hf_repo_id="rushikatabathuni/plantguard-vit")
 
 # Routes
@@ -105,8 +159,8 @@ async def root():
 @app.get("/health")
 async def health():
     return {
-        "status": "healthy", 
-        "database": "connected", 
+        "status": "healthy",  
+        "database": "connected",  
         "model": "loaded",
         "hf_repo": "rushikatabathuni/plantguard-vit"
     }
@@ -119,7 +173,6 @@ async def register(
     password: str,
     db: Session = Depends(get_db)
 ):
-    # Check if user exists
     existing_user = db.query(User).filter(
         (User.username == username) | (User.email == email)
     ).first()
@@ -127,7 +180,6 @@ async def register(
     if existing_user:
         raise HTTPException(status_code=400, detail="Username or email already registered")
     
-    # Create user
     hashed_password = get_password_hash(password)
     new_user = User(username=username, email=email, password_hash=hashed_password)
     db.add(new_user)
@@ -147,22 +199,23 @@ async def login(
     if not user or not verify_password(password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    # Create access token
     access_token = create_access_token(data={"sub": username})
     
     return {
         "access_token": access_token,
         "token_type": "bearer",
-        "username": username
+        "username": username,
+        "email": user.email # Added email for frontend
     }
+
 @app.post("/detect")
 async def detect_disease(
     file: UploadFile = File(...),
-    current_user: str = Depends(get_current_user),
+    # Use new auth dependency
+    current_user: str = Depends(get_current_username), 
     db: Session = Depends(get_db)
 ):
     try:
-        # Save uploaded file in /tmp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{current_user}_{timestamp}_{file.filename}"
         file_path = os.path.join("/tmp", filename)
@@ -170,15 +223,12 @@ async def detect_disease(
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Detect disease
         result = detector.predict(file_path)
         if not result['success']:
             raise HTTPException(status_code=500, detail=result.get('error', 'Prediction failed'))
         
-        # Get advisory
         advisory = get_advisory(result['disease_class'])
         
-        # Save detection to DB
         new_detection = Detection(
             username=current_user,
             disease_class=result['disease_class'],
@@ -190,7 +240,6 @@ async def detect_disease(
         db.commit()
         db.refresh(new_detection)
         
-        # Cleanup
         os.remove(file_path)
         
         return {
@@ -204,25 +253,34 @@ async def detect_disease(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# History route
+# History route - UPDATED with pagination
 @app.get("/history")
 async def get_history(
-    current_user: str = Depends(get_current_user),
+    skip: int = 0,
+    limit: int = 20,
+    current_user: str = Depends(get_current_username), # Use new auth dependency
     db: Session = Depends(get_db)
 ):
+    # Get total count for pagination
+    total_count = db.query(Detection).filter(
+        Detection.username == current_user
+    ).count()
+
+    # Get paginated detections
     detections = db.query(Detection).filter(
         Detection.username == current_user
-    ).order_by(Detection.created_at.desc()).limit(20).all()
+    ).order_by(Detection.created_at.desc()).offset(skip).limit(limit).all()
     
     return {
-        "total": len(detections),
+        "total": total_count, # Total detections for this user
         "detections": [
             {
                 "id": d.id,
                 "disease": d.disease_class,
                 "confidence": d.confidence,
                 "advisory": d.advisory,
-                "timestamp": d.created_at.isoformat()
+                "timestamp": d.created_at.isoformat(),
+                "feedback": d.feedback # Added feedback
             }
             for d in detections
         ]
@@ -233,7 +291,7 @@ async def get_history(
 async def submit_feedback(
     detection_id: int,
     accurate: bool,
-    current_user: str = Depends(get_current_user),
+    current_user: str = Depends(get_current_username), # Use new auth dependency
     db: Session = Depends(get_db)
 ):
     detection = db.query(Detection).filter(
@@ -249,53 +307,107 @@ async def submit_feedback(
     
     return {"message": "Feedback recorded", "detection_id": detection_id}
 
-# Admin routes
+# === ADMIN ROUTES ===
+
+# Admin routes - UPDATED with new stats and auth
 @app.get("/admin/stats")
-async def admin_stats(db: Session = Depends(get_db)):
-    # Total users
+async def admin_stats(
+    db: Session = Depends(get_db), 
+    admin: User = Depends(get_admin_user) # Use admin auth
+):
     total_users = db.query(User).count()
-    
-    # Total detections
     total_detections = db.query(Detection).count()
     
     # Feedback stats
     helpful_count = db.query(Detection).filter(Detection.feedback == True).count()
     not_helpful_count = db.query(Detection).filter(Detection.feedback == False).count()
+    pending_count = db.query(Detection).filter(Detection.feedback == None).count()
     
-    # Recent detections
-    recent_detections = db.query(Detection).order_by(Detection.created_at.desc()).limit(10).all()
+    total_feedback = helpful_count + not_helpful_count
+    accuracy = (helpful_count / total_feedback * 100) if total_feedback > 0 else 0
+
+    # Top diseases (using SQLAlchemy)
+    top_diseases_query = db.query(
+        Detection.disease_class, 
+        func.count(Detection.disease_class).label('count'), 
+        func.avg(Detection.confidence).label('avg_confidence')
+    ).group_by(Detection.disease_class).order_by(func.count(Detection.disease_class).desc()).limit(10).all()
+
+    top_diseases = [
+        {
+            "disease": d[0],
+            "count": d[1],
+            "avg_confidence": round(d[2], 4) if d[2] else 0
+        }
+        for d in top_diseases_query
+    ]
     
     return {
         "total_users": total_users,
         "total_detections": total_detections,
         "feedback": {
             "helpful": helpful_count,
-            "not_helpful": not_helpful_count
+            "not_helpful": not_helpful_count,
+            "pending": pending_count,
+            "accuracy_rate": round(accuracy, 2)
         },
-        "recent_detections": [
-            {
-                "disease": d.disease_class,
-                "confidence": d.confidence,
-                "timestamp": d.created_at.isoformat()
-            }
-            for d in recent_detections
-        ]
+        "top_diseases": top_diseases
     }
 
-# Admin user list
+# Admin user list - UPDATED with efficient query and auth
 @app.get("/admin/users")
-async def admin_users(db: Session = Depends(get_db)):
-    users = db.query(User).all()
-    detections = db.query(Detection).all()
+async def admin_users(
+    db: Session = Depends(get_db), 
+    admin: User = Depends(get_admin_user) # Use admin auth
+):
+    # Efficient query with JOIN and GROUP BY
+    user_stats_query = db.query(
+        User.id,
+        User.username,
+        User.email,
+        func.count(Detection.id).label('detection_count')
+    ).outerjoin(Detection, User.username == Detection.username).group_by(User.id, User.username, User.email).order_by(func.count(Detection.id).desc()).all()
     
-    user_stats = []
-    for user in users:
-        detection_count = len([d for d in detections if d.username == user.username])
-        user_stats.append({
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "detection_count": detection_count
-        })
+    user_stats = [
+        {
+            "id": u[0],
+            "username": u[1],
+            "email": u[2],
+            "detection_count": u[3]
+        }
+        for u in user_stats_query
+    ]
     
     return {"users": user_stats}
+
+# --- NEW ADMIN ENDPOINT ---
+@app.get("/admin/recent-detections")
+async def admin_recent_detections(
+    skip: int = 0,
+    limit: int = 50, # Default limit from your frontend request
+    db: Session = Depends(get_db), 
+    admin: User = Depends(get_admin_user) # Use admin auth
+):
+    """
+    Fetches paginated recent detections across ALL users.
+    """
+    total_count = db.query(Detection).count()
+    
+    detections_query = db.query(Detection).order_by(Detection.created_at.desc()).offset(skip).limit(limit).all()
+
+    detections = [
+        {
+            "id": d.id,
+            "username": d.username,
+            "disease": d.disease_class,
+            "confidence": d.confidence,
+            "feedback": d.feedback,
+            "timestamp": d.created_at.isoformat()
+        }
+        for d in detections_query
+    ]
+    
+    return {
+        "total": total_count,
+        "detections": detections
+    }
