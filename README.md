@@ -9,7 +9,7 @@
 
 | Service       | URL                                                                 | Status |
 |---------------|---------------------------------------------------------------------|--------|
-| Frontend      | [https://plant-guard-two.vercel.app](https://plant-guard-two.vercel.app) | 🟢 Live |
+| Frontend      | [https://plant-guard-two.vercel.app](https://plant-guard-six.vercel.app) | 🟢 Live |
 | Backend API   | [https://rushikatabathuni-plantguard-backend.hf.space](https://rushikatabathuni-plantguard-backend.hf.space) | 🟢 Live |
 | Model Hub     | [Hugging Face Model](https://huggingface.co/rushikatabathuni/plantguard-vit) | 🟢 Live |
 
